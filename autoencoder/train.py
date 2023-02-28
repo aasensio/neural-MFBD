@@ -19,6 +19,7 @@ import zarr
 try:
     import telegram
     TELEGRAM_BOT = True
+    import os
 except:
     TELEGRAM_BOT = False
 
@@ -37,8 +38,8 @@ def merge_images(image_batch, size):
 class TelegramBot(object):
 
     def __init__(self) -> None:
-        self.token = '1288438831:AAFOJgulfJojpNGk4zRVrCj-bImqn6RcjAE'
-        self.chat_id = '-468700262'
+        self.token = os.environ['TELEGRAM_TOKEN']
+        self.chat_id = os.environ['TELEGRAM_CHATID']
 
         self.bot = telegram.Bot(token=self.token)
 
