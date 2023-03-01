@@ -38,6 +38,7 @@ class Config(object):
             self.hyperparameters['n_frames'] = int(self.config_dict['images']['number of frames'])
             self.hyperparameters['n_pixel'] = int(self.config_dict['images']['number of pixel of patches'])
             self.hyperparameters['bands'] = self.config_dict['images']['bands']
+            self.hyperparameters['image_filter'] = self.config_dict['images']['image filter']
 
             # Telescope
             self.hyperparameters['wavelengths'] = [float(f) for f in self.config_dict['telescope']['wavelengths']]

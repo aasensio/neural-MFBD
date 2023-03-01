@@ -240,18 +240,18 @@ class Dataset_validation(torch.utils.data.Dataset):
         self.n_pixel = config['n_pixel']
         self.n_modes = config['n_modes']            
 
-    def patchify(self):
+    def patchify(self, step=40):
         self.n_frames, self.nx, self.ny = self.wb.shape
 
-        self.wb_patch = patchify.patchify(self.wb, (self.n_frames, self.n_pixel, self.n_pixel), step=40)
-        self.nb_patch = patchify.patchify(self.nb, (self.n_frames, self.n_pixel, self.n_pixel), step=40)
+        self.wb_patch = patchify.patchify(self.wb, (self.n_frames, self.n_pixel, self.n_pixel), step=step)
+        self.nb_patch = patchify.patchify(self.nb, (self.n_frames, self.n_pixel, self.n_pixel), step=step)
 
         x = np.arange(self.wb.shape[1])
         y = np.arange(self.wb.shape[2])
         X, Y = np.meshgrid(y, x)
         XY = np.concatenate([X[None, :, :], Y[None, :, :]], axis=0)
 
-        self.XY_patch = patchify.patchify(XY, (2, self.n_pixel, self.n_pixel), step=40)
+        self.XY_patch = patchify.patchify(XY, (2, self.n_pixel, self.n_pixel), step=step)
     
         nt, nx, ny, dimt, dimx, dimy = self.wb_patch.shape
 
@@ -318,11 +318,11 @@ class DatasetSST_validation(Dataset_validation):
       Scripts to produce the training sets : db.py
     
     """
-    def __init__(self, config, iregion, index, wav=0, mod=0, cam=0):
+    def __init__(self, config, iregion, index, wav=0, mod=0, cam=0, step=40):
         super(DatasetSST_validation, self).__init__(config)
                 
         self.wb, self.nb, self.wl = images.read_images_sst(iregion, index, wav, mod, cam)
-        self.patchify()
+        self.patchify(step=step)
 
 class DatasetHiFi_validation(Dataset_validation):
     """
@@ -331,8 +331,8 @@ class DatasetHiFi_validation(Dataset_validation):
       Scripts to produce the training sets : db.py
     
     """
-    def __init__(self, config, root, nac=12):
+    def __init__(self, config, root, nac=12, step=40):
         super(DatasetHiFi_validation, self).__init__(config)
                 
         self.wb, self.nb, self.wl = images.read_images_hifi(root, nac)
-        self.patchify()
+        self.patchify(step=step)

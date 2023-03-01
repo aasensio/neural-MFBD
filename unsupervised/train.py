@@ -19,10 +19,15 @@ matplotlib.use('Agg')
 try:
     import telegram
     TELEGRAM_BOT = True
+    import os
 except:
     TELEGRAM_BOT = False
 
 class TelegramBot(object):
+    """
+    Telegram Bot for messaging with information during training
+
+    """
 
     def __init__(self) -> None:
         self.token = os.environ['TELEGRAM_TOKEN']
@@ -44,6 +49,7 @@ class FastMFBD(object):
                 
         """        
 
+        # Set checkpoint file in case a previous training is to be resumed
         self.checkpoint = checkpoint
 
         # Read configuration file
@@ -58,6 +64,7 @@ class FastMFBD(object):
         self.cuda = torch.cuda.is_available()        
         self.n_gpus = len(self.config['gpus'])
                 
+        # Smooth factor for the loss function
         self.smooth = 0.15
         
         # Number of GPUs in use
@@ -85,6 +92,7 @@ class FastMFBD(object):
         if (self.config['dataset_instrument'] == 'HiFi'):
             self.dataset = datasets.DatasetHiFi(self.config)
 
+        # Shuffle the training set
         idx = np.arange(self.dataset.n_training)
         np.random.shuffle(idx)
 
@@ -116,7 +124,7 @@ class FastMFBD(object):
         self.config['n_pixel'] = self.dataset.n_pixel
         self.config['n_frames'] = self.dataset.n_frames        
                 
-        # Define the neural network model
+        # Instantiate the model
         print("Defining the model...")
         netmodel = model.Model(self.config)
         
@@ -130,13 +138,14 @@ class FastMFBD(object):
             self.multi_gpu = True
         else:
             self.multi_gpu = False
-    
+        
         print(f"Training sample size : {len(self.train_loader) * self.config['batch_size']}")
         print(f"Validation sample size : {len(self.validation_loader) * self.config['batch_size']}")
         
         # Move model to GPU/CPU
         self.model = netmodel.to(self.device)
 
+        # Initialize the Telegram bot if present
         if (TELEGRAM_BOT):
             self.bot = TelegramBot()
             print(f'Telegram Bot active: {self.bot}')
@@ -165,13 +174,14 @@ class FastMFBD(object):
             lr=self.config['lr'], 
             weight_decay=self.config['wd'])
                 
-
         # Instantiate scheduler
-        # self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(self.optimizer, 
-                        # self.config['n_epochs'], 
-                        # eta_min=self.config['scheduler_decay']*self.config['lr'])
+        n_batches = len(self.train_loader)
+        print(f'Number of batches : {n_batches}')
+        self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(self.optimizer, 
+                        self.config['n_epochs'] * n_batches, 
+                        eta_min=self.config['scheduler_decay']*self.config['lr'])
         
-
+        # Load checkpoint in case it is present
         if (self.checkpoint is not None):
             print(f"Loading checkpoint {self.checkpoint}")
             chk = torch.load(self.checkpoint)
@@ -207,22 +217,20 @@ class FastMFBD(object):
             # Do one epoch for the validation set
             loss_avg = self.validate(epoch)
 
-            # Update learning rate if needed
-            # self.scheduler.step()
-
             if (self.multi_gpu):
                 model = self.model.module.state_dict()
             else:
                 model = self.model.state_dict()
-                        
+            
+            # Save checkpoint
             checkpoint = {
-            'epoch': epoch,
-            'state_dict': model,
-            'optimizer_state_dict': self.optimizer.state_dict(),
-            'best_loss': best_loss,
-            'hyperparameters': self.config,
-            'loss': self.loss,
-            'val_loss': self.loss_val
+                'epoch': epoch,
+                'state_dict': model,
+                'optimizer_state_dict': self.optimizer.state_dict(),
+                'best_loss': best_loss,
+                'hyperparameters': self.config,
+                'loss': self.loss,
+                'val_loss': self.loss_val
             }
 
             best_loss = loss_avg
@@ -261,21 +269,25 @@ class FastMFBD(object):
             wl = wl.to(self.device)
 
             n = self.config['npix_apodization']
-        
+
+            # Zero the parameter gradients
             self.optimizer.zero_grad()
-                                    
+            
+            # Evaluate the model
             modes, psf, wavefront, degraded, reconstructed, reconstructed_apod, loss = self.model(frames, 
                 frames_apod,
                 wl, 
                 sigma, 
                 weight, 
-                image_filter='gaussian')
-                #image_filter='lofdahl_scharmer')
+                image_filter=self.config['image_filter'])
 
-            
+            # Backpropagate
             loss.backward()
+
+            # Update parameters
             self.optimizer.step()
-                                                                        
+
+            # Update averaged loss function                                                                        
             if (batch_idx == 0):
                 loss_avg = loss.item()
             else:
@@ -289,6 +301,7 @@ class FastMFBD(object):
                         pass
                 sys.exit()
                 
+            # Do some printing
             lo_max = torch.max(modes[:, :, 0:2]).item()
             lo_min = torch.min(modes[:, :, 0:2]).item()
             ho_max = torch.max(modes[:, :, 2:]).item()
@@ -300,6 +313,7 @@ class FastMFBD(object):
 
             n = self.config['npix_apodization'] // 2
             
+            # Do some plots
             if (batch_idx % self.config['frequency_png'] == 0):
 
                 n_images = 8
@@ -341,7 +355,7 @@ class FastMFBD(object):
             
                 if (TELEGRAM_BOT):
                     try:
-                        self.bot.send_message(f'Ep: {epoch} - batch: {batch_idx} - L={loss_avg:7.4f} - r={ratio_loss_avg:7.4f}')
+                        self.bot.send_message(f'Ep: {epoch} - batch: {batch_idx} - L={loss_avg:7.4f}')
                         self.bot.send_image('samples/modes.png')                    
                         self.bot.send_image('samples/images.png')
                     except:
@@ -357,10 +371,11 @@ class FastMFBD(object):
                 tmp = nvidia_smi.nvmlDeviceGetMemoryInfo(self.handle[i])
                 memory_usage = memory_usage+f' {tmp.used / tmp.total * 100.0:4.1f}'
 
+            # Update the progress bar
             tmp = OrderedDict()
             tmp['gpu'] = gpu_usage
             tmp['mem'] = memory_usage
-            tmp['lr'] = current_lr
+            tmp['lr'] = f'{current_lr:8.6f}'
             tmp['lo'] = f'{lo_min:6.3f}/{lo_max:6.3f}'
             tmp['ho'] = f'{ho_min:6.3f}/{ho_max:6.3f}'
             tmp['imin'] = f'{i1_min:6.3f}/{i2_min:6.3f}'
@@ -369,6 +384,9 @@ class FastMFBD(object):
             t.set_postfix(ordered_dict = tmp)
                             
             self.loss.append(loss_avg)
+
+            # Update learning rate if needed
+            self.scheduler.step()
 
         return loss_avg
 
@@ -435,8 +453,7 @@ if (__name__ == '__main__'):
     parser = argparse.ArgumentParser()
     parser.add_argument('--config', default='config.ini', type=str)
     args = parser.parse_args()
-
-    # deep_mfbd_network = FastMFBD(configuration_file=args.config, checkpoint='weights/2022-10-17-14:27_ep_4.pth')
+    
     deep_mfbd_network = FastMFBD(configuration_file=args.config, checkpoint=None)
     deep_mfbd_network.init_optimize()
     deep_mfbd_network.optimize()

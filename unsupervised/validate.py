@@ -83,13 +83,13 @@ class FastMFBD(object):
         for param in self.model.parameters():
             param.requires_grad = False
 
-    def set_observations_SST(self, iregion, index, wav=0, mod=0, cam=0):
+    def set_observations_SST(self, iregion, index, wav=0, mod=0, cam=0, step=40):
         # Read training and validation sets
-        self.dataset = datasets.DatasetSST_validation(self.config, iregion, index, wav=wav, mod=mod, cam=cam)
+        self.dataset = datasets.DatasetSST_validation(self.config, iregion, index, wav=wav, mod=mod, cam=cam, step=step)
 
-    def set_observations_HiFi(self, root, nac=12):
+    def set_observations_HiFi(self, root, nac=12, step=40):
         # Read training and validation sets
-        self.dataset = datasets.DatasetHiFi_validation(self.config, root, nac=nac)
+        self.dataset = datasets.DatasetHiFi_validation(self.config, root, nac=nac, step=step)
                 
     def validate_fov(self, outf):
         """
@@ -195,7 +195,7 @@ if (__name__ == '__main__'):
 
         # Hifi
         root = '/net/delfin/scratch/ckuckein/gregor/hifi2/momfbd/20221128/scan_b000'
-        deep_mfbd_network.set_observations_HiFi(root, nac=12)
+        deep_mfbd_network.set_observations_HiFi(root, nac=12, step=38)
         deep_mfbd_network.validate_fov(f'reconstructed/test.HiFi.h5')
 
     
@@ -210,15 +210,15 @@ if (__name__ == '__main__'):
         time = checkpoint.split('/')[-1].split('.')[0]
 
         for i in range(70, 130):
-            deep_mfbd_network.set_observations_SST(iregion=8, index=i, wav=13)
+            deep_mfbd_network.set_observations_SST(iregion=8, index=i, wav=13, step=38)
             deep_mfbd_network.validate_fov(f'reconstructed/val_spot_20200727_083509.3934.{i:02d}.{time}.SST.h5')
         
         for i in range(0, 50):
-            deep_mfbd_network.set_observations_SST(iregion=9, index=i, wav=7)
+            deep_mfbd_network.set_observations_SST(iregion=9, index=i, wav=7, step=38)
             deep_mfbd_network.validate_fov(f'reconstructed/val_spot_20200727_083509.8542.{i:02d}.{time}.SST.h5')
 
         for i in range(10, 50):
-            deep_mfbd_network.set_observations_SST(iregion=10, index=i, wav=7)
+            deep_mfbd_network.set_observations_SST(iregion=10, index=i, wav=7, step=38)
             deep_mfbd_network.validate_fov(f'reconstructed/val_qs_20190801_081547.8542.{i:02d}.{time}.SST.h5')
             
         # for i in range(20, 40):
