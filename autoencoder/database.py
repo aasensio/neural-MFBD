@@ -32,34 +32,49 @@ class Database(nn.Module):
 
         self.config = config
 
+        n_wavelengths = len(self.config['wavelengths'])
+        print(f"Defining pupils for wavelengths : {self.config['wavelengths']}")
+
         self.cuda = torch.cuda.is_available()
-        self.device = torch.device(f"cuda:{self.config['gpu']}" if self.cuda else "cpu")      
+        self.device = torch.device(f"cuda:{self.config['gpu']}" if self.cuda else "cpu")
+
+        self.pupil = []
+        self.basis = []
+        self.kl = []
         
         # Compute the overfill to properly generate the PSFs from the wavefronts
-        self.overfill = util.psf_scale(self.config['wavelength'], 
-                                        self.config['diameter'], 
-                                        self.config['pix_size'])
+        for loop in range(n_wavelengths):
 
-        if (self.overfill < 1.0):
-            raise Exception(f"The pixel size is not small enough to model a telescope with D={self.telescope_diameter} cm")
+            wl = f"{int(self.config['wavelengths'][loop]):4d}"
 
-        # Compute telescope aperture
-        pupil = util.aperture(npix=self.config['n_pixel'], 
-                        cent_obs = self.config['central_obs'] / self.config['diameter'], 
-                        spider=0, 
-                        overfill=self.overfill)
-                        
-        self.kl = kl_modes.KL()
-        basis = self.kl.precalculate(npix_image = self.config['n_pixel'], 
-                            n_modes_max = self.config['n_modes'], 
-                            first_noll = 4,
-                            overfill=self.overfill)            
-        basis /= np.max(np.abs(basis), axis=(1, 2), keepdims=True)
-    
-        self.pupil = torch.tensor(pupil.astype('float32')).to(self.device)
-        self.basis = torch.tensor(basis.astype('float32')).to(self.device)
+            # Compute the overfill to properly generate the PSFs from the wavefronts
+            overfill = util.psf_scale(self.config['wavelengths'][loop], 
+                                            self.config['diameter'][loop], 
+                                            self.config['pix_size'][loop])
+            
+            if (overfill < 1.0):
+                raise Exception(f"The pixel size is not small enough to model a telescope with D={self.telescope_diameter} cm")
+
+            # Compute telescope aperture
+            pupil = util.aperture(npix=self.config['n_pixel'], 
+                            cent_obs = self.config['central_obs'][loop] / self.config['diameter'][loop], 
+                            spider=0, 
+                            overfill=overfill)
+                    
+            # Karhunen-Loeve modes            
+            print(f"Computing KL modes for {wl}")
+            kl = kl_modes.KL()                
+            basis = kl.precalculate(npix_image = self.config['n_pixel'], 
+                                n_modes_max = self.config['n_modes'], 
+                                first_noll = 2, 
+                                overfill=overfill)
+            basis /= np.max(np.abs(basis), axis=(1, 2), keepdims=True)
+            
+            self.pupil.append(torch.tensor(pupil.astype('float32')))
+            self.basis.append(torch.tensor(basis.astype('float32')))
+            self.kl.append(kl)
                      
-    def compute_psfs(self, modes):
+    def compute_psfs(self, modes, pupil, basis):
         """Compute the PSFs and their Fourier transform from a set of modes
         
         Args:
@@ -72,19 +87,18 @@ class Database(nn.Module):
         # --------------
         # Focused PSF
         # --------------
-                
         # Compute wavefronts from estimated modes        
-        wavefront = torch.einsum('ik,klm->ilm', modes, self.basis)
+        wavefront = torch.einsum('ij,ijlm->ilm', modes, basis)
 
         # Compute the complex phase
-        phase = self.pupil[None, :, :] * torch.exp(1j * wavefront)
+        phase = pupil * torch.exp(1j * wavefront)
 
         # Compute FFT of the pupil function and compute autocorrelation
         ft = torch.fft.fft2(phase)
         psf = (torch.conj(ft) * ft).real
         
         # Normalize PSF to unit amplitude        
-        psf_norm = psf / torch.amax(psf, dim=(1,2))[:, None, None]
+        psf_norm = psf / torch.amax(psf, dim=(1, 2))[:, None, None]
         
         return wavefront, torch.fft.fftshift(psf_norm)
 
@@ -95,52 +109,72 @@ class Database(nn.Module):
         psf_all = []
         modes_all = []
         r0_all = []
+        wl_all = []
+        D_all = []
 
         for i in tqdm(range(n_batches)):
             
             r0 = np.random.uniform(low=r0_min, high=r0_max, size=batchsize)
-            coef = (self.config['diameter'] / r0)**(5.0/6.0)
+            ind = np.random.randint(low=0, high=len(self.config['diameter']), size=batchsize)
+            D = np.array(self.config['diameter'])[ind]
+            D_all.append(D)
+            wl = np.array(self.config['wavelengths'])[ind]
+            wl_all.append(wl)
 
-            # We do not consider the first mode
-            sigma_KL = np.sqrt(self.kl.varKL)
-            sigma_KL = coef[:, None] * sigma_KL
+            coef = (D / r0)**(5.0/6.0)
+            
+            # Compute standard deviation of the modes
+            sigma_KL = np.zeros((batchsize, self.config['n_modes']))
+            pupil = []
+            basis = []            
+            for j in range(batchsize):
+                sigma_KL[j, :] = coef[j] * np.sqrt(self.kl[ind[j]].varKL)
+                pupil.append(self.pupil[ind[j]][None, :, :])
+                basis.append(self.basis[ind[j]][None, :, :])
 
+            pupil = torch.cat(pupil, dim=0).to(self.device)
+            basis = torch.cat(basis, dim=0).to(self.device)
+            
             modes = np.random.normal(loc=0.0, scale=sigma_KL, size=sigma_KL.shape)
             modes_all.append(modes)
             
             modes = torch.tensor(modes.astype('float32')).to(self.device)
                         
-            wavefront, psf_norm = self.compute_psfs(modes)
+            wavefront, psf_norm = self.compute_psfs(modes, pupil, basis)
 
             psf_all.append(psf_norm.squeeze().cpu().numpy())
             r0_all.append(r0)
+            wl_all.append(wl)
+            D_all.append(D)
 
         psf_all = np.concatenate(psf_all, axis=0)
         modes_all = np.concatenate(modes_all, axis=0)
         r0_all = np.concatenate(r0_all, axis=0)
+        wl_all = np.concatenate(wl_all, axis=0)
+        D_all = np.concatenate(D_all, axis=0)
 
-        return psf_all, modes_all, r0_all
+        return psf_all, modes_all, r0_all, wl_all, D_all
         
     
 if (__name__ == '__main__'):
     config = {
         'gpu': 0,        
-        'wavelength': 8542.0,
-        'diameter': 100.0,
-        'pix_size': 0.059,
+        'wavelengths': [3934.0, 6173.0, 8542.0, 6563.0],
+        'diameter': [100.0, 100.0, 100.0, 144.0],
+        'pix_size': [0.038, 0.059, 0.059, 0.04979],
         'n_pixel': 64,
-        'central_obs': 0.0,
+        'central_obs': [0.0, 0.0, 0.0, 0.0],
         'n_modes': 44   
         }
             
     db = Database(config)
-    psf_all, modes_all, r0_all = db.calculate(batchsize=32, n_batches=1000, r0_min=4.0, r0_max=20.0)
+    psf_all, modes_all, r0_all, wl_all, D_all = db.calculate(batchsize=32, n_batches=10, r0_min=4.0, r0_max=20.0)
 
-    f = zarr.open('training.zarr', 'w')
-    psfd = f.create_dataset('psf', shape=psf_all.shape, dtype=np.float32)
-    modesd = f.create_dataset('modes', shape=modes_all.shape, dtype=np.float32)
-    r0d = f.create_dataset('r0', shape=r0_all.shape, dtype=np.float32)
+    # f = zarr.open('training.zarr', 'w')
+    # psfd = f.create_dataset('psf', shape=psf_all.shape, dtype=np.float32)
+    # modesd = f.create_dataset('modes', shape=modes_all.shape, dtype=np.float32)
+    # r0d = f.create_dataset('r0', shape=r0_all.shape, dtype=np.float32)
 
-    psfd[:] = psf_all
-    modesd[:] = modes_all
-    r0d[:] = r0_all
+    # psfd[:] = psf_all
+    # modesd[:] = modes_all
+    # r0d[:] = r0_all

@@ -14,6 +14,42 @@ from astropy.io import fits
 from collections import OrderedDict
 from tqdm import tqdm
 
+class MLP(nn.Module):
+    def __init__(self, sizes, n_heads=1):
+        """
+        Simple fully connected network
+        """
+        super(MLP, self).__init__()
+
+        shared = []
+        for i in range(len(sizes) - 2):
+            shared.append(nn.Linear(sizes[i], sizes[i + 1]))
+            if (i < len(sizes)-2):
+                shared.append(nn.ReLU())
+
+        self.shared = nn.Sequential(*shared)
+
+        self.n_heads = n_heads
+
+        self.heads = []
+        for i in range(n_heads):
+            self.heads.append(nn.Linear(sizes[-2], sizes[-1]))
+
+        self.heads = nn.ModuleList(self.heads)
+        
+    def forward(self, x):
+        shared = self.shared(x)
+
+        if (self.n_heads == 1):
+            return self.heads[0](shared)
+        else:
+            heads = []
+            for i in range(len(self.heads)):
+                heads.append(self.heads[i](shared))
+
+            return heads
+    
+
 class DoubleConv(nn.Module):
     """(convolution => [BN] => ReLU) * 2"""
 
@@ -76,13 +112,18 @@ class OutConv(nn.Module):
         return self.conv(x)
 
 class UNet(nn.Module):
-    def __init__(self, n_channels, n_classes, channels_latent=8, n_bottleneck=128, bilinear=False, beta=0):
+    def __init__(self, n_channels, n_classes, channels_latent=8, n_bottleneck=128, bilinear=False, beta=0, n_pixel=64):
         super(UNet, self).__init__()
         self.n_channels = n_channels
         self.n_classes = n_classes
-        self.bilinear = bilinear    
+        self.bilinear = bilinear
         self.beta = beta
+        self.channels_latent = channels_latent
         factor = 2 if bilinear else 1
+
+        self.w = n_pixel // 8
+        self.h = n_pixel // 8
+        self.c = 8 * channels_latent
 
         #--------------
         # Encoder
@@ -94,6 +135,7 @@ class UNet(nn.Module):
 
         encoder = [inc, down1, down2, down3]
         self.encoder = nn.Sequential(*encoder)
+        self.encoder_MLP = MLP([self.w * self.h * self.c, 256, 256])
 
         #--------------
         # Decoder
@@ -108,44 +150,65 @@ class UNet(nn.Module):
 
         #--------------
         # Bottleneck
-        #--------------
+        #--------------       
         if (beta == 0):
             
-            self.bottleneck_encoder = nn.Linear(8*8*64, n_bottleneck)            
+            self.bottleneck_encoder = MLP([256, 128, n_bottleneck])
 
         else:
             
-            self.bottleneck_encoder_mu = nn.Linear(8*8*64, n_bottleneck)
-            self.bottleneck_encoder_logvar = nn.Linear(8*8*64, n_bottleneck)
+            self.bottleneck_encoder_mu = MLP([256, 128, n_bottleneck])
+            self.bottleneck_encoder_logvar = MLP([256, 128, n_bottleneck])
+
+        self.bottleneck_decoder = MLP([n_bottleneck, 256, 1024, self.w * self.h * self.c])
             
-        self.bottleneck_decoder = nn.Linear(n_bottleneck, 8*8*64)
+        #--------------
+        # Conditioning
+        #--------------
+        self.conditioning_encoder = MLP([2, 256], n_heads=2)
+        self.conditioning_decoder = MLP([2, n_bottleneck], n_heads=2)
 
     def reparameterize(self, mu, logvar):
         std = torch.exp(0.5*logvar)
         eps = torch.randn_like(std)
         return mu + eps*std
 
-    def forward(self, psf):
+    def forward(self, psf, wl, D):
         
         # Encode the PSF
-        enc = self.encoder(psf)
-        
-        encp = enc.view(-1, 64*8*8)
+        enc = self.encoder(psf)        
 
-        # Now go through the bottleneck
+        # Flatten the encoding
+        encp = enc.view(-1, self.w * self.h * self.c)
+
+        # Final MLP reducing the enconding to a smaller dimension
+        encp = self.encoder_MLP(encp)
+
+        # Condition the encoding using FiLM
+        gamma, beta = self.conditioning_encoder(torch.cat([wl[:, None], D[:, None]], dim=1))
+        encp_conditioned = encp * gamma + beta
+
+        # Now go through the bottleneck depending on whether we are using VAE or not
         if (self.beta == 0):
             mu = None
             logvar = None
-            z = self.bottleneck_encoder(encp)            
+            z = self.bottleneck_encoder(encp_conditioned)
         else:
             mu = self.bottleneck_encoder_mu(encp)
             logvar = self.bottleneck_encoder_logvar(encp)
             z = self.reparameterize(mu, logvar)
+
+        # Condition the decoder using FiLM
+        gamma, beta = self.conditioning_decoder(torch.cat([wl[:, None], D[:, None]], dim=1))
+        z_conditioned = z * gamma + beta
         
-        zp = self.bottleneck_decoder(z)
+        # Increase the size of the bottleneck for the final decoder
+        zp = self.bottleneck_decoder(z_conditioned)
 
-        zp = zp.view(-1, 64, 8, 8)
+        # Reshape the bottleneck
+        zp = zp.view(-1, self.c, self.w, self.h)
 
+        # Decode the bottleneck
         out = self.decoder(zp)
         
         return out, mu, z, logvar
@@ -178,21 +241,22 @@ class Model(nn.Module):
         #----------------        
         self.autoencoder = UNet(n_channels=1, 
                     n_classes=1, 
-                    channels_latent=8, 
+                    channels_latent=self.config['channels_latent'], 
                     n_bottleneck=self.config['n_bottleneck'], 
                     bilinear=True, 
-                    beta=self.config['beta'])
+                    beta=self.config['beta'],
+                    n_pixel=self.config['n_pixel'])
                                      
-    def forward(self, psf):
+    def forward(self, psf, wl, D):
         
         # CNN encoder       
-        out, mu, z, logvar = self.autoencoder(psf)
+        out, mu, z, logvar = self.autoencoder(psf, wl, D)
 
         return out, mu, z, logvar
 
-    def loss(self, psf):
+    def loss(self, psf, wl, D):
 
-        recons, mu, z, logvar = self.forward(psf)
+        recons, mu, z, logvar = self.forward(psf, wl, D)
 
         recons_loss = torch.mean( (psf.squeeze() - recons.squeeze()) **2 / 1e-3**2)
         kld_loss = torch.tensor(0.0)

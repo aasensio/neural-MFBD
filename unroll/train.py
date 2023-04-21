@@ -1,35 +1,39 @@
 import sys
 sys.path.append('../modules')
 import matplotlib
+# matplotlib.use('Agg')
+import shutil
 import numpy as np
 import torch
+import torch.nn as nn
 import torch.utils.data
+import h5py
+from torch.autograd import Variable
 import time
 from tqdm import tqdm
 import model_nopd_wiener as model
 import argparse
 import nvidia_smi
+import os
 import sys
+import platform
 import config
 import matplotlib.pyplot as pl
+import time
 import pathlib
 from collections import OrderedDict
+import scipy.ndimage as nd
+import subprocess
 from images import merge_images
 import datasets
-matplotlib.use('Agg')
 
 try:
     import telegram
     TELEGRAM_BOT = True
-    import os
 except:
     TELEGRAM_BOT = False
 
 class TelegramBot(object):
-    """
-    Telegram Bot for messaging with information during training
-
-    """
 
     def __init__(self) -> None:
         self.token = os.environ['TELEGRAM_TOKEN']
@@ -51,7 +55,6 @@ class FastMFBD(object):
                 
         """        
 
-        # Set checkpoint file in case a previous training is to be resumed
         self.checkpoint = checkpoint
 
         # Read configuration file
@@ -65,8 +68,9 @@ class FastMFBD(object):
         # Is CUDA available?
         self.cuda = torch.cuda.is_available()        
         self.n_gpus = len(self.config['gpus'])
+
+        self.training_type = self.config['training_type']
                 
-        # Smooth factor for the loss function
         self.smooth = 0.15
         
         # Number of GPUs in use
@@ -91,6 +95,7 @@ class FastMFBD(object):
         # Read training and validation sets
         if (self.config['dataset_instrument'] == 'SST'):
             self.dataset = datasets.DatasetSST(self.config)
+            
             # Get number of pixels and frames from the dataset                
             self.config['n_pixel'] = self.dataset.n_pixel
             self.config['n_frames'] = self.dataset.n_frames
@@ -98,7 +103,8 @@ class FastMFBD(object):
             self.dataset = datasets.DatasetHiFi(self.config)
             # Get number of pixels and frames from the dataset                
             self.config['n_pixel'] = self.dataset.n_pixel
-            self.config['n_frames'] = self.dataset.n_frames
+            self.config['n_frames'] = self.dataset.n_frames        
+
         if (self.config['dataset_instrument'] == 'All'):
             self.dataset_sst = datasets.DatasetSST(self.config)
             self.dataset_hifi = datasets.DatasetHiFi(self.config)
@@ -107,7 +113,6 @@ class FastMFBD(object):
             self.config['n_pixel'] = self.dataset_sst.n_pixel
             self.config['n_frames'] = self.dataset_sst.n_frames
 
-        # Shuffle the training set
         n_training = len(self.dataset)
         idx = np.arange(n_training)
         np.random.shuffle(idx)
@@ -135,9 +140,9 @@ class FastMFBD(object):
                     drop_last=True, 
                     sampler=self.validation_sampler, 
                     **kwargs)
-        
+            
                 
-        # Instantiate the model
+        # Define the neural network model
         print("Defining the model...")
         netmodel = model.Model(self.config)
         
@@ -151,17 +156,23 @@ class FastMFBD(object):
             self.multi_gpu = True
         else:
             self.multi_gpu = False
-        
+    
         print(f"Training sample size : {len(self.train_loader) * self.config['batch_size']}")
         print(f"Validation sample size : {len(self.validation_loader) * self.config['batch_size']}")
         
         # Move model to GPU/CPU
         self.model = netmodel.to(self.device)
 
-        # Initialize the Telegram bot if present
         if (TELEGRAM_BOT):
             self.bot = TelegramBot()
-            print(f'Telegram Bot active: {self.bot}')
+
+        if (self.training_type == 'sequential'):
+            print("Sequential training")
+            self.optimize_internal = True
+
+        if (self.training_type == 'end-to-end'):
+            print("End-to-end training")
+            self.optimize_internal = False
                 
     def read_config(self):
         """
@@ -182,19 +193,20 @@ class FastMFBD(object):
         current_time = time.strftime("%Y-%m-%d-%H:%M")
         self.out_name = f"weights/{current_time}.{self.config['dataset_instrument']}"
 
-        # Optimizer
-        self.optimizer = torch.optim.Adam(self.model.parameters(), 
-            lr=self.config['lr'], 
-            weight_decay=self.config['wd'])
+
+        if (self.training_type == 'end-to-end'):
+            # Optimizer
+            self.optimizer = torch.optim.Adam(self.model.parameters(), 
+                lr=self.config['lr'], 
+                weight_decay=self.config['wd'])
                 
+
         # Instantiate scheduler
-        n_batches = len(self.train_loader)
-        print(f'Number of batches : {n_batches}')
-        self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(self.optimizer, 
-                        self.config['n_epochs'] * n_batches, 
-                        eta_min=self.config['scheduler_decay']*self.config['lr'])
+        # self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(self.optimizer, 
+                        # self.config['n_epochs'], 
+                        # eta_min=self.config['scheduler_decay']*self.config['lr'])
         
-        # Load checkpoint in case it is present
+
         if (self.checkpoint is not None):
             print(f"Loading checkpoint {self.checkpoint}")
             chk = torch.load(self.checkpoint)
@@ -221,6 +233,8 @@ class FastMFBD(object):
         
         print('Model : {0}'.format(self.out_name))
 
+        epoch_modes = -1
+
         # Loop over epochs
         for epoch in range(self.epoch_initial, self.config['n_epochs'] + 1):
                         
@@ -230,20 +244,22 @@ class FastMFBD(object):
             # Do one epoch for the validation set
             loss_avg = self.validate(epoch)
 
+            # Update learning rate if needed
+            # self.scheduler.step()
+
             if (self.multi_gpu):
                 model = self.model.module.state_dict()
             else:
                 model = self.model.state_dict()
-            
-            # Save checkpoint
+                        
             checkpoint = {
-                'epoch': epoch,
-                'state_dict': model,
-                'optimizer_state_dict': self.optimizer.state_dict(),
-                'best_loss': best_loss,
-                'hyperparameters': self.config,
-                'loss': self.loss,
-                'val_loss': self.loss_val
+            'epoch': epoch,
+            'state_dict': model,
+            'optimizer_state_dict': [f.state_dict() for f in self.model.optimizer],
+            'best_loss': best_loss,
+            'hyperparameters': self.config,
+            'loss': self.loss,
+            'val_loss': self.loss_val
             }
 
             best_loss = loss_avg
@@ -263,13 +279,15 @@ class FastMFBD(object):
         current_time = time.strftime("%Y-%m-%d-%H:%M")
         print(f"Epoch {epoch}/{self.config['n_epochs']} - {current_time}")
         t = tqdm(self.train_loader)
+
+        loop = 0
         
         # Get current learning rate
         if (self.multi_gpu):
-            for param_group in self.module.optimizer.param_groups:
+            for param_group in self.model.module.optimizer[0].param_groups:
                 current_lr = param_group['lr']
         else:
-            for param_group in self.optimizer.param_groups:
+            for param_group in self.model.optimizer[0].param_groups:
                 current_lr = param_group['lr']
 
         for batch_idx, (frames, frames_apod, wl, sigma, weight) in enumerate(t):
@@ -283,28 +301,29 @@ class FastMFBD(object):
 
             n = self.config['npix_apodization']
 
-            # Zero the parameter gradients
-            self.optimizer.zero_grad()
-            
-            # Evaluate the model
-            modes, psf, wavefront, degraded, reconstructed, reconstructed_apod, loss = self.model(frames, 
+            if (self.training_type == 'end-to-end'):
+                self.optimizer.zero_grad()
+                                    
+            modes, psf, wavefront, degraded, reconstructed, reconstructed_apod, loss, ratio_loss = self.model(frames, 
                 frames_apod,
                 wl, 
                 sigma, 
                 weight, 
-                image_filter=self.config['image_filter'])
+                image_filter='gaussian',
+                optimize=self.optimize_internal)
+                #image_filter='lofdahl_scharmer')
 
-            # Backpropagate
-            loss.backward()
 
-            # Update parameters
-            self.optimizer.step()
-
-            # Update averaged loss function                                                                        
+            if (self.training_type == 'end-to-end'):
+                loss.backward()
+                self.optimizer.step()
+                                                                        
             if (batch_idx == 0):
                 loss_avg = loss.item()
+                ratio_loss_avg = ratio_loss
             else:
                 loss_avg = self.smooth * loss.item() + (1.0 - self.smooth) * loss_avg
+                ratio_loss_avg = self.smooth * ratio_loss + (1.0 - self.smooth) * ratio_loss_avg
 
             if (np.isnan(loss_avg)):
                 if (TELEGRAM_BOT):
@@ -314,7 +333,6 @@ class FastMFBD(object):
                         pass
                 sys.exit()
                 
-            # Do some printing
             lo_max = torch.max(modes[:, :, 0:2]).item()
             lo_min = torch.min(modes[:, :, 0:2]).item()
             ho_max = torch.max(modes[:, :, 2:]).item()
@@ -323,15 +341,25 @@ class FastMFBD(object):
             i1_max = torch.max(reconstructed_apod[0, 0, n:-n, n:-n]).item()
             i2_min = torch.min(reconstructed_apod[0, 1, n:-n, n:-n]).item()
             i2_max = torch.max(reconstructed_apod[0, 1, n:-n, n:-n]).item()            
+            if (self.multi_gpu):
+                rho = [self.model.module.update_net.rho[i].item() for i in range(self.config['gradient_steps'])]
+                rho = torch.tensor(rho)                
+            else:
+                rho = [self.model.update_net.rho[i].item() for i in range(self.config['gradient_steps'])]
+                rho = torch.tensor(rho)            
+            rho_min = torch.min(rho)
+            rho_max = torch.max(rho)
 
             n = self.config['npix_apodization'] // 2
             
-            # Do some plots
             if (batch_idx % self.config['frequency_png'] == 0):
 
-                n_images = 8
-                
-                labels = ['Frames WB', 'Frames NB', 'Deg WB', 'Deg NB', 'Diff WB', 'Diff NB', 'WF', 'sqrtPSF', 'PSF', 'Rec WB', 'Avg WB', 'Rec NB', 'Avg NB']
+                if (self.training_type == 'end-to-end'):
+                    n_images = 8
+                else:
+                    n_images = 10
+
+                labels = ['Frames WB', 'Frames NB', 'Deg WB', 'Deg NB', 'Diff WB', 'Diff NB', 'sqrtWF', 'WF', 'PSF', 'Rec WB', 'Avg WB', 'Rec NB', 'Avg NB']
 
                 tmp = frames_apod[0:n_images, 0, 0, :, :]
                 tmp = torch.cat([tmp, frames_apod[0:n_images, 0, 1, :, :]], dim=0)
@@ -365,10 +393,10 @@ class FastMFBD(object):
                 pl.savefig('samples/modes.png')
                 pl.close()
                               
-            
+            if (batch_idx % self.config['frequency_png'] == 0):
                 if (TELEGRAM_BOT):
                     try:
-                        self.bot.send_message(f'Unsupervised - Ep: {epoch} - batch: {batch_idx} - L={loss_avg:7.4f}')
+                        self.bot.send_message(f'Ep: {epoch} - batch: {batch_idx} - L={loss_avg:7.4f} - r={ratio_loss_avg:7.4f}')
                         self.bot.send_image('samples/modes.png')                    
                         self.bot.send_image('samples/images.png')
                     except:
@@ -384,22 +412,20 @@ class FastMFBD(object):
                 tmp = nvidia_smi.nvmlDeviceGetMemoryInfo(self.handle[i])
                 memory_usage = memory_usage+f' {tmp.used / tmp.total * 100.0:4.1f}'
 
-            # Update the progress bar
             tmp = OrderedDict()
             tmp['gpu'] = gpu_usage
             tmp['mem'] = memory_usage
-            tmp['lr'] = f'{current_lr:8.6f}'
+            tmp['lr'] = current_lr
             tmp['lo'] = f'{lo_min:6.3f}/{lo_max:6.3f}'
             tmp['ho'] = f'{ho_min:6.3f}/{ho_max:6.3f}'
             tmp['imin'] = f'{i1_min:6.3f}/{i2_min:6.3f}'
             tmp['imax'] = f'{i1_max:6.3f}/{i2_max:6.3f}'
+            tmp['rho'] = f'{rho_min:6.3f}/{rho_max:6.3f}'
+            tmp['ratio'] = f'{ratio_loss_avg:8.5f}'
             tmp['loss'] = f'{loss_avg:8.5f}'
             t.set_postfix(ordered_dict = tmp)
                             
             self.loss.append(loss_avg)
-
-            # Update learning rate if needed
-            self.scheduler.step()
 
         return loss_avg
 
@@ -417,10 +443,10 @@ class FastMFBD(object):
         loss_l1_avg = 0
         
         if (self.multi_gpu):
-            for param_group in self.module.optimizer.param_groups:
+            for param_group in self.model.module.optimizer[0].param_groups:
                 current_lr = param_group['lr']
         else:
-            for param_group in self.optimizer.param_groups:
+            for param_group in self.model.optimizer[0].param_groups:
                 current_lr = param_group['lr']
             
         # with torch.no_grad():
@@ -433,7 +459,7 @@ class FastMFBD(object):
             weight = weight.to(self.device)
             wl = wl.to(self.device)
                                     
-            modes, psf, wavefront, degraded, reconstructed, reconstructed_apod, loss = self.model(frames, frames_apod, wl, sigma, weight, optimize=False, image_filter=self.config['image_filter'])
+            modes, psf, wavefront, degraded, reconstructed, reconstructed_apod, loss, ratio_loss = self.model(frames, frames_apod, wl, sigma, weight, optimize=False, image_filter='gaussian')
 
             loss = torch.sum(loss)
 
@@ -466,7 +492,8 @@ if (__name__ == '__main__'):
     parser = argparse.ArgumentParser()
     parser.add_argument('--config', default='config.ini', type=str)
     args = parser.parse_args()
-    
+
+    # deep_mfbd_network = FastMFBD(configuration_file=args.config, checkpoint='weights/2022-10-17-14:27_ep_4.pth')
     deep_mfbd_network = FastMFBD(configuration_file=args.config, checkpoint=None)
     deep_mfbd_network.init_optimize()
     deep_mfbd_network.optimize()

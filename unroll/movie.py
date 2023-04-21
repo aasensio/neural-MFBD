@@ -1,9 +1,9 @@
+import sys
+sys.path.append('../modules')
 import napari
 import numpy as np
 import h5py
 from tqdm import tqdm
-import sys
-sys.path.append('../modules')
 from movie_gen import WRITERS
 
 
@@ -49,15 +49,12 @@ def dummy_image_generator(root='reconstructed/validation_plage_8542', label='', 
         yield out
 
 if __name__ == '__main__':
-    
-    label = '2023-03-10-12:44.All'
 
-    root_raw = '/net/drogon/scratch1/aasensio/sst_unroll/qs_20190801_081547/raw'
+    label='2023-03-03-15:26.SST'
 
-    roots = ['/scratch1/aasensio/sst_unroll/spot_20200727_083509_8542/unsup/val_spot_20200727_083509.8542']#, 
-            #  '/scratch1/aasensio/sst_unroll/spot_20200727_083509_3934/unsup/val_spot_20200727_083509.3934', 
-            #  '/scratch1/aasensio/sst_unroll/qs_20190801_081547/unsup/val_qs_20190801_081547.8542']
-    
+    roots = ['/scratch1/aasensio/sst_unroll/spot_20200727_083509_8542/unrolled/val_spot_20200727_083509.8542', 
+             '/scratch1/aasensio/sst_unroll/spot_20200727_083509_3934/unrolled/val_spot_20200727_083509.3934', 
+             '/scratch1/aasensio/sst_unroll/qs_20190801_081547/unrolled/val_qs_20190801_081547.8542']
     i0s = [0, 70, 10]
     i1s = [50, 130, 50]
 

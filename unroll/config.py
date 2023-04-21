@@ -30,6 +30,9 @@ class Config(object):
             self.hyperparameters['precision'] = self.config_dict['training']['precision']            
             self.hyperparameters['frequency_png'] = int(self.config_dict['training']['frequency png'])
             self.hyperparameters['gamma_modes'] = float(self.config_dict['training']['regularization parameter for modes'])            
+            self.hyperparameters['gradient_steps'] = int(self.config_dict['training']['number of gradient steps'])
+            self.hyperparameters['correction_mode'] = self.config_dict['training']['correction mode']
+            self.hyperparameters['training_type'] = self.config_dict['training']['training type']
             
             # Images
             self.hyperparameters['npix_apodization'] = int(self.config_dict['images']['apodization in pixel'])
@@ -38,7 +41,6 @@ class Config(object):
             self.hyperparameters['n_frames'] = int(self.config_dict['images']['number of frames'])
             self.hyperparameters['n_pixel'] = int(self.config_dict['images']['number of pixel of patches'])
             self.hyperparameters['bands'] = self.config_dict['images']['bands']
-            self.hyperparameters['image_filter'] = self.config_dict['images']['image filter']
 
             # Telescope
             self.hyperparameters['wavelengths'] = [float(f) for f in self.config_dict['telescope']['wavelengths']]
@@ -60,9 +62,8 @@ class Config(object):
                 
 
             # Architecture
-            self.hyperparameters['resnet_type'] = self.config_dict['architecture']['resnet type']
+            self.hyperparameters['type_cleaning'] = self.config_dict['architecture']['type of cleaning']
             self.hyperparameters['n_internal_channels'] = int(self.config_dict['architecture']['internal channels'])
-            self.hyperparameters['internal_depth'] = int(self.config_dict['architecture']['internal depth'])
                                                     
     def read_configuration(self, configuration_file):
 
